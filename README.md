@@ -9,7 +9,7 @@ This repository demonstrates an AWS fanout architecture built with Terraform and
 - SNS topic (fanout) that publishes to multiple SQS queues
 - Publisher Lambda (API Gateway HTTP API) — only publishes to SNS, no persistence
 - Consumer Lambdas — one per SQS queue, each saves the processed message to DynamoDB
-- Dead-Letter Queues — one per main queue, receives messages after 3 failed consumer attempts
+- Dead-Letter Queues — one per main queue, with active dead-letter redrive policy after 3 failed consumer attempts
 - DynamoDB table — written by consumers on success (proof of processing, not just receipt)
 - CloudWatch Log Groups, Metric Filters and Alarms for SNS, SQS, DLQs and Lambda errors
 - **60-second delivery delay** on all queues — messages sit in SQS for 60s in `Delayed` state before consumers can pick them up; use `make poll` to watch the lifecycle in real time
@@ -62,7 +62,7 @@ Targets:
   terraform-apply    Deploy infrastructure (SNS, SQS, IAM, CloudWatch)
   serverless-deploy  Deploy Lambda functions via Serverless Framework
   publish            Publish a test message to SNS
-  poll               Watch all 3 SQS queues every 10s (Delayed/InFlight/Visible) — Ctrl+C to stop
+  poll               Watch all 3 SQS queues every 10s (Retrasado/En proceso/Disponible) — Ctrl+C to stop
   destroy            Remove ALL resources (Serverless + Terraform)
 
 Examples:
@@ -80,7 +80,7 @@ Examples:
 | `make terraform-apply [REGION=...]` | Runs `terraform apply` with `aws_region` and writes `outputs.json` |
 | `make serverless-deploy [REGION=...]` | Runs `npm install` + `sls deploy --region` inside `serverless/` |
 | `make publish [REGION=...]` | Publishes a test message to SNS using the venv Python |
-| `make poll [REGION=...]` | Watches all 3 SQS queues every 10s showing Delayed / InFlight / Visible counts — runs until `Ctrl+C` |
+| `make poll [REGION=...]` | Watches all 3 SQS queues every 10s mostrando Retrasado / En proceso / Disponible — runs until `Ctrl+C` |
 | `make destroy [REGION=...]` | Removes all resources: Serverless stack first, then Terraform infrastructure |
 
 ### Region selection
@@ -150,23 +150,51 @@ make poll
 make publish
 ```
 
+### Simular fallos en las colas
+
+Puedes forzar que los consumidores fallen y provoquen reintentos (y finalmente envío a la DLQ) de dos maneras:
+
+- Publicando un mensaje cuyo cuerpo JSON contenga `{"force_fail": true}`. Por ejemplo:
+
+```bash
+AWS_DEFAULT_REGION=eu-west-1 serverless/.venv/bin/python serverless/publish.py '{"force_fail": true}'
+```
+
+- Habilitando la variable de entorno `FORCE_FAIL=1` en las funciones consumidoras (requiere redeploy):
+
+En `serverless/serverless.yml` añade bajo la función consumer:
+
+```yaml
+environment:
+  FORCE_FAIL: '1'
+  # opcional: SLOW_CONSUMER_SECONDS: '20'
+```
+
+Luego redeploy con:
+
+```bash
+make serverless-deploy REGION=eu-west-1
+```
+
+Cuando un consumidor falla, la excepción hace que Lambda falle y SQS reintente según `maxReceiveCount`; tras los reintentos el mensaje irá a su DLQ.
+
 `make poll` refreshes every 10 seconds and shows the full message lifecycle:
 
 ```
 ─────────────────────────────────────── 14:32:00
-  Queue 1 → Delayed: 1  |  InFlight: 0  |  Visible: 0   ← message just arrived
-  Queue 2 → Delayed: 1  |  InFlight: 0  |  Visible: 0
-  Queue 3 → Delayed: 1  |  InFlight: 0  |  Visible: 0
+  Cola 1 → Retrasado: 1  |  En proceso: 0  |  Disponible: 0   ← mensaje recién llegado
+  Cola 2 → Retrasado: 1  |  En proceso: 0  |  Disponible: 0
+  Cola 3 → Retrasado: 1  |  En proceso: 0  |  Disponible: 0
 
 ─────────────────────────────────────── 14:33:00   ← after 60s delay
-  Queue 1 → Delayed: 0  |  InFlight: 1  |  Visible: 0   ← Lambda processing
-  Queue 2 → Delayed: 0  |  InFlight: 1  |  Visible: 0
-  Queue 3 → Delayed: 0  |  InFlight: 1  |  Visible: 0
+  Cola 1 → Retrasado: 0  |  En proceso: 1  |  Disponible: 0   ← Lambda consumidora procesando
+  Cola 2 → Retrasado: 0  |  En proceso: 1  |  Disponible: 0
+  Cola 3 → Retrasado: 0  |  En proceso: 1  |  Disponible: 0
 
 ─────────────────────────────────────── 14:33:10
-  Queue 1 → Delayed: 0  |  InFlight: 0  |  Visible: 0   ← processed ✓
-  Queue 2 → Delayed: 0  |  InFlight: 0  |  Visible: 0
-  Queue 3 → Delayed: 0  |  InFlight: 0  |  Visible: 0
+  Cola 1 → Retrasado: 0  |  En proceso: 0  |  Disponible: 0   ← procesado ✓
+  Cola 2 → Retrasado: 0  |  En proceso: 0  |  Disponible: 0
+  Cola 3 → Retrasado: 0  |  En proceso: 0  |  Disponible: 0
 ```
 
 Press `Ctrl+C` to stop polling. Then verify the 3 DynamoDB records were written:
@@ -202,7 +230,7 @@ DLQ_1_URL=$(jq -r '.dlqs[0].url' terraform/outputs.json)
 
 ### Test 1 — Publish and observe the fan-out in real time
 
-The queues have a **60-second delivery delay**: messages arrive in SQS immediately in `Delayed` state and consumers cannot pick them up for 60 seconds. `make poll` watches this lifecycle automatically every 10 seconds.
+The queues have a **60-second delivery delay**: messages arrive in SQS immediately in `Retrasado` state and consumers cannot pick them up for 60 seconds. `make poll` watches this lifecycle automatically every 10 seconds.
 
 **Terminal 1:**
 ```bash
@@ -223,11 +251,11 @@ curl -s -X POST "$API_ENDPOINT/publish" \
 
 Watch Terminal 1 progress through three phases:
 
-| Phase | Delayed | InFlight | Visible | Meaning |
+| Phase | Retrasado | En proceso | Disponible | Meaning |
 |---|---|---|---|---|
-| 0–60s | 1 | 0 | 0 | Message held in delay window |
-| ~60s | 0 | 1 | 0 | Consumer Lambda executing |
-| done | 0 | 0 | 0 | Processed and saved to DynamoDB |
+| 0–60s | 1 | 0 | 0 | Mensaje retenido en ventana de espera |
+| ~60s | 0 | 1 | 0 | Lambda consumidora ejecutando (procesando) |
+| done | 0 | 0 | 0 | Procesado y guardado en DynamoDB |
 
 After polling completes, verify **3 DynamoDB records** — one per consumer:
 
@@ -280,6 +308,10 @@ Expected: all three counters at `0` on every queue.
 ---
 
 ### Test 4 — Verify DLQ behaviour (failure path)
+
+This project already has an active dead-letter queue configuration on each main SQS queue via Terraform redrive policy:
+- `maxReceiveCount = 3`
+- failed messages move to the corresponding DLQ after 3 consumer retries
 
 To confirm messages route to the DLQ after 3 failed processing attempts, temporarily break `consumer_1` by setting an invalid `DDB_TABLE_NAME` via the AWS console or CLI, then publish a message.
 

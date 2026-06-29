@@ -32,6 +32,21 @@ def _save_to_dynamodb(message_id, body, queue_arn):
     )
 
 
+def _maybe_slow_down():
+    """If SLOW_CONSUMER env var set, sleep to simulate long processing.
+
+    This extends the SQS InFlight window so you can observe processing.
+    """
+    slow = os.getenv('SLOW_CONSUMER')
+    if slow and slow != '0':
+        try:
+            secs = int(os.getenv('SLOW_CONSUMER_SECONDS', '15'))
+        except Exception:
+            secs = 15
+        logging.getLogger().info('SLOW_CONSUMER active: sleeping %s seconds', secs)
+        time.sleep(secs)
+
+
 def handler(event, context):
     records = event.get('Records', [])
     logger.info('Received %d records (consumer=%s)', len(records), CONSUMER_ID)
@@ -41,7 +56,27 @@ def handler(event, context):
         body = r.get('body', '')
         queue_arn = r.get('eventSourceARN', '')
         logger.info('Processing messageId=%s consumer=%s', message_id, CONSUMER_ID)
+        _maybe_slow_down()
+        # Allow simulated failures for testing/debugging.
+        # Trigger by either setting FORCE_FAIL=1 in the Lambda env or by
+        # publishing a JSON body containing {"force_fail": true}.
+        should_fail = False
+        if os.getenv('FORCE_FAIL') == '1':
+            should_fail = True
+        else:
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict) and parsed.get('force_fail'):
+                    should_fail = True
+            except Exception:
+                # body not JSON — ignore
+                pass
+
         try:
+            if should_fail:
+                logger.error('Simulated consumer failure for messageId=%s consumer=%s', message_id, CONSUMER_ID)
+                raise RuntimeError('Simulated consumer failure')
+
             _save_to_dynamodb(message_id, body, queue_arn)
         except Exception:
             logger.exception('Failed to save messageId=%s to DynamoDB', message_id)
