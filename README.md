@@ -62,6 +62,10 @@ Targets:
   terraform-apply    Deploy infrastructure (SNS, SQS, IAM, CloudWatch)
   serverless-deploy  Deploy Lambda functions via Serverless Framework
   publish            Publish a test message to SNS
+  publish-ok         Same as publish, but without forced failure
+  fail-publish       Publish a message that forces consumers to fail (force_fail=true)
+  fail-publish-status  Show queue and DLQ status for failed publish tests
+  purge-dlqs         Purge all DLQs to clear failed messages
   poll               Watch all 3 SQS queues every 10s (Retrasado/En proceso/Disponible) — Ctrl+C to stop
   destroy            Remove ALL resources (Serverless + Terraform)
 
@@ -69,6 +73,8 @@ Examples:
   make terraform-apply REGION=eu-west-1
   make serverless-deploy REGION=eu-west-1
   make publish && make poll
+  make fail-publish && make fail-publish-status
+  make purge-dlqs
 ```
 
 ### Target details
@@ -80,6 +86,10 @@ Examples:
 | `make terraform-apply [REGION=...]` | Runs `terraform apply` with `aws_region` and writes `outputs.json` |
 | `make serverless-deploy [REGION=...]` | Runs `npm install` + `sls deploy --region` inside `serverless/` |
 | `make publish [REGION=...]` | Publishes a test message to SNS using the venv Python |
+| `make publish-ok [REGION=...]` | Same as `make publish`, but explicitly indicates normal publish path with no forced failure |
+| `make fail-publish [REGION=...]` | Publishes a message that forces consumers to fail via `force_fail=true` |
+| `make fail-publish-status [REGION=...]` | Shows queue and DLQ status for failed publish tests |
+| `make purge-dlqs [REGION=...]` | Purges all DLQs by reading the DLQ URLs from `terraform/outputs.json` |
 | `make poll [REGION=...]` | Watches all 3 SQS queues every 10s mostrando Retrasado / En proceso / Disponible — runs until `Ctrl+C` |
 | `make destroy [REGION=...]` | Removes all resources: Serverless stack first, then Terraform infrastructure |
 
@@ -314,6 +324,8 @@ This project already has an active dead-letter queue configuration on each main 
 - failed messages move to the corresponding DLQ after 3 consumer retries
 
 To confirm messages route to the DLQ after 3 failed processing attempts, temporarily break `consumer_1` by setting an invalid `DDB_TABLE_NAME` via the AWS console or CLI, then publish a message.
+
+Use `make fail-publish` to send a failure-trigger message, `make fail-publish-status` to inspect queue/DLQ counts, and `make purge-dlqs` to clear failed messages from DLQs once the test is complete.
 
 ```bash
 # 1. Check DLQ is empty before the test
